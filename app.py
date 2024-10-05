@@ -1,147 +1,104 @@
-import spaces
-import torch
-
 import gradio as gr
-import yt_dlp as youtube_dl
-from transformers import pipeline
-from transformers.pipelines.audio_utils import ffmpeg_read
+from transformers import AutoModelForCausalLM, AutoTokenizer,StoppingCriteria,StoppingCriteriaList,pipeline
+from langchain.chains import ConversationChain
+from langchain.chains.conversation.memory import ConversationBufferWindowMemory
+from langchain.llms import HuggingFacePipeline
+from langchain import PromptTemplate
+from typing import List
+import torch
+# Load the model and tokenizer
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
+model = AutoModelForCausalLM.from_pretrained("gpt2")
 
-import tempfile
-import os
+generation_config = model.generation_config
+generation_config.temperature = 0
+generation_config.num_return_sequences = 1
+generation_config.max_new_tokens = 256
+generation_config.use_cache = False
+generation_config.repetition_penalty = 1.7
+generation_config.pad_token_id = tokenizer.eos_token_id
+generation_config.eos_token_id = tokenizer.eos_token_id
+generation_config
+stop_tokens = [["Human", ":"], ["AI", ":"]]
 
-MODEL_NAME = "ylacombe/whisper-large-v3-turbo"
-BATCH_SIZE = 8
-FILE_LIMIT_MB = 1000
-YT_LENGTH_LIMIT_S = 3600  # limit to 1 hour YouTube files
+class StopGenerationCriteria(StoppingCriteria):
+    def __init__(
+        self, tokens: List[List[str]], tokenizer: AutoTokenizer, device: torch.device
+    ):
+        stop_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in tokens]
+        self.stop_token_ids = [
+            torch.tensor(x, dtype=torch.long, device=device) for x in stop_token_ids
+        ]
 
-device = 0 if torch.cuda.is_available() else "cpu"
+    def __call__(
+        self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs
+    ) -> bool:
+        for stop_ids in self.stop_token_ids:
+            if torch.eq(input_ids[0][-len(stop_ids) :], stop_ids).all():
+                return True
+        return False
 
-pipe = pipeline(
-    task="automatic-speech-recognition",
-    model=MODEL_NAME,
-    chunk_length_s=30,
-    device=device,
+
+stopping_criteria = StoppingCriteriaList(
+    [StopGenerationCriteria(stop_tokens, tokenizer, model.device)]
 )
 
+class StopGenerationCriteria(StoppingCriteria):
+    def __init__(
+        self, tokens: List[List[str]], tokenizer: AutoTokenizer, device: torch.device
+    ):
+        stop_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in tokens]
+        self.stop_token_ids = [
+            torch.tensor(x, dtype=torch.long, device=device) for x in stop_token_ids
+        ]
 
-@spaces.GPU
-def transcribe(inputs, task):
-    if inputs is None:
-        raise gr.Error("No audio file submitted! Please upload or record an audio file before submitting your request.")
-
-    text = pipe(inputs, batch_size=BATCH_SIZE, generate_kwargs={"task": task}, return_timestamps=True)["text"]
-    return  text
-
-
-def _return_yt_html_embed(yt_url):
-    video_id = yt_url.split("?v=")[-1]
-    HTML_str = (
-        f'<center> <iframe width="500" height="320" src="https://www.youtube.com/embed/{video_id}"> </iframe>'
-        " </center>"
-    )
-    return HTML_str
-
-def download_yt_audio(yt_url, filename):
-    info_loader = youtube_dl.YoutubeDL()
-    
-    try:
-        info = info_loader.extract_info(yt_url, download=False)
-    except youtube_dl.utils.DownloadError as err:
-        raise gr.Error(str(err))
-    
-    file_length = info["duration_string"]
-    file_h_m_s = file_length.split(":")
-    file_h_m_s = [int(sub_length) for sub_length in file_h_m_s]
-    
-    if len(file_h_m_s) == 1:
-        file_h_m_s.insert(0, 0)
-    if len(file_h_m_s) == 2:
-        file_h_m_s.insert(0, 0)
-    file_length_s = file_h_m_s[0] * 3600 + file_h_m_s[1] * 60 + file_h_m_s[2]
-    
-    if file_length_s > YT_LENGTH_LIMIT_S:
-        yt_length_limit_hms = time.strftime("%HH:%MM:%SS", time.gmtime(YT_LENGTH_LIMIT_S))
-        file_length_hms = time.strftime("%HH:%MM:%SS", time.gmtime(file_length_s))
-        raise gr.Error(f"Maximum YouTube length is {yt_length_limit_hms}, got {file_length_hms} YouTube video.")
-    
-    ydl_opts = {"outtmpl": filename, "format": "worstvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"}
-    
-    with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-        try:
-            ydl.download([yt_url])
-        except youtube_dl.utils.ExtractorError as err:
-            raise gr.Error(str(err))
-
-@spaces.GPU
-def yt_transcribe(yt_url, task, max_filesize=75.0):
-    html_embed_str = _return_yt_html_embed(yt_url)
-
-    with tempfile.TemporaryDirectory() as tmpdirname:
-        filepath = os.path.join(tmpdirname, "video.mp4")
-        download_yt_audio(yt_url, filepath)
-        with open(filepath, "rb") as f:
-            inputs = f.read()
-
-    inputs = ffmpeg_read(inputs, pipe.feature_extractor.sampling_rate)
-    inputs = {"array": inputs, "sampling_rate": pipe.feature_extractor.sampling_rate}
-
-    text = pipe(inputs, batch_size=BATCH_SIZE, generate_kwargs={"task": task}, return_timestamps=True)["text"]
-
-    return html_embed_str, text
+    def __call__(
+        self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs
+    ) -> bool:
+        for stop_ids in self.stop_token_ids:
+            if torch.eq(input_ids[0][-len(stop_ids) :], stop_ids).all():
+                return True
+        return False
 
 
-demo = gr.Blocks()
-
-mf_transcribe = gr.Interface(
-    fn=transcribe,
-    inputs=[
-        gr.Audio(sources="microphone", type="filepath"),
-        gr.Radio(["transcribe", "translate"], label="Task", value="transcribe"),
-    ],
-    outputs="text",
-    title="Whisper Large V3 Turbo: Transcribe Audio",
-    description=(
-        "Transcribe long-form microphone or audio inputs with the click of a button! Demo uses the"
-        f" checkpoint [{MODEL_NAME}](https://huggingface.co/{MODEL_NAME}) and 🤗 Transformers to transcribe audio files"
-        " of arbitrary length."
-    ),
-    allow_flagging="never",
+generation_pipeline = pipeline(
+    model=model,
+    tokenizer=tokenizer,
+    return_full_text=True,
+    task="text-generation",
+    stopping_criteria=stopping_criteria,
+    generation_config=generation_config,
 )
 
-file_transcribe = gr.Interface(
-    fn=transcribe,
-    inputs=[
-        gr.Audio(sources="upload", type="filepath", label="Audio file"),
-        gr.Radio(["transcribe", "translate"], label="Task", value="transcribe"),
-    ],
-    outputs="text",
-    title="Whisper Large V3: Transcribe Audio",
-    description=(
-        "Transcribe long-form microphone or audio inputs with the click of a button! Demo uses the"
-        f" checkpoint [{MODEL_NAME}](https://huggingface.co/{MODEL_NAME}) and 🤗 Transformers to transcribe audio files"
-        " of arbitrary length."
-    ),
-    allow_flagging="never",
+llm = HuggingFacePipeline(pipeline=generation_pipeline)
+template = """
+The following 
+Current conversation:
+
+{history}
+
+Human: {input}
+AI:""".strip()
+prompt = PromptTemplate(input_variables=["history", "input"], template=template)
+
+memory = ConversationBufferWindowMemory(
+    memory_key="history", k=6, return_only_outputs=True
 )
 
-yt_transcribe = gr.Interface(
-    fn=yt_transcribe,
-    inputs=[
-        gr.Textbox(lines=1, placeholder="Paste the URL to a YouTube video here", label="YouTube URL"),
-        gr.Radio(["transcribe", "translate"], label="Task", value="transcribe")
-    ],
-    outputs=["html", "text"],
-    title="Whisper Large V3: Transcribe YouTube",
-    description=(
-        "Transcribe long-form YouTube videos with the click of a button! Demo uses the checkpoint"
-        f" [{MODEL_NAME}](https://huggingface.co/{MODEL_NAME}) and 🤗 Transformers to transcribe video files of"
-        " arbitrary length."
-    ),
-    allow_flagging="never",
+chain = ConversationChain(
+    llm=llm,
+    prompt=prompt,
+    verbose=True,
 )
 
-with demo:
-    gr.TabbedInterface([mf_transcribe, file_transcribe, yt_transcribe], ["Microphone", "Audio file", "YouTube"])
+def generate_response(input_text):
+    res=chain.invoke(input_text)
+    print('response:',res)
+    print(4444444444444444444444444444444444444444444444)
+    inputs = tokenizer(input_text, return_tensors="pt")
+    outputs = model.generate(inputs.input_ids, max_length=50)
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return res
 
-demo.queue().launch()
-
+iface = gr.Interface(fn=generate_response, inputs="text", outputs="text")
+iface.launch()
